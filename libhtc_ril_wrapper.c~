@@ -278,6 +278,7 @@ void hackSetupData(char **data, size_t datalen, RIL_Token t)
 
 	sleep(5);
 	LOGD("PL: hackSetupData: launching pppd\n");
+	//plLaunchPPP();
 	mypppstatus = system("/system/bin/pppd /dev/smd1 defaultroute");
 	if (mypppstatus < 0) {
 		LOGD("PL: system(/system/bin/pppd failed\n");
