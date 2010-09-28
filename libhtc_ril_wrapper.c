@@ -279,7 +279,7 @@ void hackSetupData(char **data, size_t datalen, RIL_Token t)
 	sleep(5);
 	LOGD("PL: hackSetupData: launching pppd\n");
 	mypppstatus = system("/system/bin/pppd /dev/smd1 defaultroute");
-	if (mypppstatus < 0) {
+	if (mypppstatus != 0) {
 		LOGD("PL: system(/system/bin/pppd failed\n");
 		goto error;
 	}
@@ -298,6 +298,58 @@ void hackSetupData(char **data, size_t datalen, RIL_Token t)
 		RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
+static int
+checkHaretBoot()
+{
+  int fd;
+  char cmdline[512];
+
+  fd = open ("/proc/cmdline", O_RDONLY);
+
+  if (fd < 0)
+    {
+      LOGD("Unable to open /proc/cmdline");
+      return -1;
+    }
+
+  if (read (fd, cmdline, sizeof(cmdline)) < 0)
+    {
+      LOGD("Unable to read /proc/cmdline");
+      return -1;
+    }
+  LOGD("Kernel command line is: '%s'", cmdline);
+  
+  close (fd);
+  return strstr(cmdline,"nand_boot=0");
+}
+
+
+void writeAdditionalNandInit(){
+	LOGD("NAND boot, writing additional init commands to /dev/smd0");
+	int err = 0;
+	int fd_smd;
+	struct termios  ios;
+
+	fd_smd = open ("/dev/smd0", O_RDWR);
+
+	if(fd_smd  == -1)  {
+		LOGD("PL:writeInit: Error opening smd0\n");
+	}
+
+	tcgetattr( fd_smd, &ios );
+	ios.c_lflag = 0;  /* disable ECHO, ICANON, etc... */
+	tcsetattr( fd_smd, TCSANOW, &ios );
+	
+	err += hackWrite(fd_smd, "AT@BRIC=0");
+	sleep(1);
+	err += hackWrite(fd_smd, "AT+CFUN=0");
+	sleep(1);
+	err += hackWrite(fd_smd, "AT+COPS=2");
+	sleep(1);
+	
+	close(fd_smd);
+}
+
 void (*htc_onRequest)(int request, void *data, size_t datalen, RIL_Token t);
 void onRequest(int request, void *data, size_t datalen, RIL_Token t) {
 	if(request==RIL_REQUEST_SETUP_DATA_CALL){ // Let's have fun !
@@ -313,6 +365,8 @@ void onRequest(int request, void *data, size_t datalen, RIL_Token t) {
 const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **argv) {
 	s_rilenv = env;
 
+	if(!checkHaretBoot()) writeAdditionalNandInit();
+	
 	ril_handler=dlopen("/system/lib/libhtc_ril.so", 0/*Need to RTFM, 0 seems fine*/);
 	RIL_RadioFunctions* (*htc_RIL_Init)(const struct RIL_Env *env, int argc, char **argv);
 
