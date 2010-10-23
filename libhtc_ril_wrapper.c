@@ -34,6 +34,22 @@ static const struct RIL_Env *s_rilenv;
 
 static void *ril_handler=NULL;
 
+static int pppMode = 0;
+
+int file_exists (char * fileName)
+{
+   struct stat buf;
+   int i = stat ( fileName, &buf );
+     /* File found */
+     if ( i == 0 )
+     {
+       return 1;
+     }
+     return 0;
+       
+}
+
+
 int hackWrite (int s_fd, const char *s)
 {
 	size_t cur = 0;
@@ -352,12 +368,14 @@ void writeAdditionalNandInit(){
 
 void (*htc_onRequest)(int request, void *data, size_t datalen, RIL_Token t);
 void onRequest(int request, void *data, size_t datalen, RIL_Token t) {
-	if(request==RIL_REQUEST_SETUP_DATA_CALL){ // Let's have fun !
-		hackSetupData(data, datalen, t);
-		return;
-	} else if(request==RIL_REQUEST_DEACTIVATE_DATA_CALL) {
-		hackDeactivateData(data, datalen, t);
-		return;
+	if(pppMode){
+		if(request==RIL_REQUEST_SETUP_DATA_CALL){ // Let's have fun !
+			hackSetupData(data, datalen, t);
+			return;
+		} else if(request==RIL_REQUEST_DEACTIVATE_DATA_CALL) {
+			hackDeactivateData(data, datalen, t);
+			return;
+		}
 	}
 	return htc_onRequest(request, data, datalen, t);
 }
@@ -366,6 +384,13 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
 	s_rilenv = env;
 
 	if(!checkHaretBoot()) writeAdditionalNandInit();
+	
+	if(file_exists("/system/etc/ppp/active")){
+			pppMode = 1;
+			LOGD("Using PPP mode");
+		} else {
+			LOGD("Using RMNET mode");
+		}
 	
 	ril_handler=dlopen("/system/lib/libhtc_ril.so", 0/*Need to RTFM, 0 seems fine*/);
 	RIL_RadioFunctions* (*htc_RIL_Init)(const struct RIL_Env *env, int argc, char **argv);
