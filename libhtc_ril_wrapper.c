@@ -22,49 +22,62 @@
 #include "misc.h"
 #include <getopt.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <cutils/sockets.h>
 #include <termios.h>
 #include <utils/Log.h>
+#include <time.h>
 
+#undef LOG_TAG
 #define LOG_TAG "RILW"
 
 #define RIL_onRequestComplete(t, e, response, responselen) s_rilenv->OnRequestComplete(t,e, response, responselen)
 
 static const struct RIL_Env *s_rilenv;
+static struct RIL_Env htcril_env;
 
 static void *ril_handler=NULL;
 
-static int pppMode = 0;
+static int rmnet_mode = 0;
+static int nand_init = 0;
+static int is_data_active=0;
+static int is_network_ready=0;
+static int pppd_pid, monitor_pid;
+static RIL_Token request_call_list_token = 0;
+static RIL_Token request_registration_state_token = 0;
 
-int file_exists (char * fileName)
+int send_modem(const char * cmd)
 {
-   struct stat buf;
-   int i = stat ( fileName, &buf );
-     /* File found */
-     if ( i == 0 )
-     {
-       return 1;
-     }
-     return 0;
-       
-}
-
-
-int hackWrite (int s_fd, const char *s)
-{
+	int err = 0;
+	int fd_smd;
+	struct termios  ios;
 	size_t cur = 0;
-	size_t len = strlen(s);
 	ssize_t written;
+	size_t len = strlen(cmd);
 
-	LOGD("AT> %s\n", s);
+
+	fd_smd = open ("/dev/smd0", O_RDWR);
+
+	if(fd_smd  == -1)  {
+		LOGD("PL:send_modem: Error opening smd0\n");
+        return AT_ERROR_GENERIC;
+	}
+
+	tcgetattr( fd_smd, &ios );
+	ios.c_lflag = 0;  /* disable ECHO, ICANON, etc... */
+	tcsetattr( fd_smd, TCSANOW, &ios );
+
+	LOGD("AT> %s\n", cmd);
 
 	/* the main string */
 	while (cur < len) {
 		do {
-			written = write (s_fd, s + cur, len - cur);
+			written = write (fd_smd, cmd + cur, len - cur);
 		} while (written < 0 && errno == EINTR);
 
 		if (written < 0) {
+            close(fd_smd);
 			return AT_ERROR_GENERIC;
 		}
 
@@ -74,46 +87,188 @@ int hackWrite (int s_fd, const char *s)
 	/* the \r  */
 	
 	do {
-		written = write (s_fd, "\r" , 1);
+		written = write (fd_smd, "\r" , 1);
 	} while ((written < 0 && errno == EINTR) || (written == 0));
 
 	if (written < 0) {
+        close(fd_smd);
 		return AT_ERROR_GENERIC;
 	}
 
-	return 0;
+	close(fd_smd);
+    return written;
 }
 
+void set_network_ready()
+{
+    LOGW("PL: monitor notif netup");
+    is_network_ready = 1;
+}
+
+void reset_network_ready()
+{
+    LOGW("PL: monitor notif netdown");
+    is_network_ready = 0;
+}
+
+
+void launch_pppd()
+{
+    int status;
+    LOGW("PL: start pppd mon");
+    monitor_pid = fork();
+    if(monitor_pid == 0) {
+        time_t last_run, die_time;
+        int failure_cnt = 0;
+        // install signal handler to be notified of network avail
+        signal(SIGUSR1, set_network_ready);
+        signal(SIGUSR2, reset_network_ready);
+        while(1) {
+            LOGD("PL: mon: start pppd (net=%d)", is_network_ready);
+            if(!is_network_ready) {
+                LOGW("PL: network is not ready, waiting");
+                sleep(1);
+            }
+            else {
+                time(&last_run);
+                pppd_pid = fork();
+                if(pppd_pid == 0) {
+                    LOGD("PL: atd+ppd");
+                    send_modem("AT+CGACT=0,1");
+                    sleep(1);
+                    send_modem("ATD*99***1#");
+                    execl("/system/bin/pppd", "/system/bin/pppd", "nodetach", "/dev/smd1", "defaultroute", "debug", (char *)0);
+                    LOGE("PL: unable to launch pppd");
+                }
+                else {
+                    LOGD("PL: pppd launch (pid=%d)", pppd_pid);
+                    while(wait(&status) != pppd_pid)
+                        LOGD("PL:wait:%d", status);
+                    LOGW("PL: pppd died (0x%x)", status);
+                    time(&die_time);
+                    if(die_time - last_run < 5) {
+                        // pppd died in less than 5 seconds
+                        failure_cnt++;
+                        if(failure_cnt > 3) {
+                            LOGD("PL: failure_cnt=%d", failure_cnt);
+                            // atd won't cut it, slow down respawn
+                            sleep(5 * failure_cnt);
+                        }
+                    }
+                    else {
+                        failure_cnt = 1;
+                    }
+                    sleep(3);
+                }
+            }
+        }
+    }
+}
+
+void interceptOnRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responselen)
+{
+    int i;
+    LOGD("PL:InterceptRequestComplete(%d, %d)", (int)t, responselen);
+    if(request_call_list_token == t) {
+        // response from data call list
+        request_call_list_token = 0;
+        LOGW("PL: token is from RequestDataCallList");
+        RIL_Data_Call_Response *data_calls = (RIL_Data_Call_Response *)response;
+        for(i = 0 ; i < (int)(responselen / sizeof(RIL_Data_Call_Response)); i++) {
+            LOGD("PL:call[%d]-cid=%d, active=%d, type=%s, apn=%s, address=%s\n",
+                 i,
+                 data_calls[i].cid,
+                 data_calls[i].active,
+                 data_calls[i].type,
+                 data_calls[i].apn,
+                 data_calls[i].address
+                );
+        }
+    } else if(request_registration_state_token == t) {
+        char **strings;
+        request_registration_state_token = 0;
+        strings = (char **)response;
+        int strings_cnt = (int)(responselen / sizeof(char *));
+
+        LOGW("PL: token is from RequestRegistrationState, %d strings", strings_cnt);
+        for(i = 0 ; i < strings_cnt; i++) {
+            LOGD("PL: resp[%d] = %s", i, strings[i]);
+        }
+        // Workaround for htc_ril bug, it sometimes set null to string[0] that make rild crash
+        if(strings[0] == NULL)
+            strings[0] = "0";
+
+        if((strings_cnt > 3) && (strings[0] != NULL) && (strings[3] != NULL)) {
+            if((atoi(strings[0]) != 0) && (atoi(strings[3]) != 0)) {
+                LOGW("PL: Reg State: Network ready");
+                is_network_ready = 1;
+                // Notify monitoring thread
+                if(monitor_pid) {
+                    LOGW("PL: Notif mon(%d) netup", monitor_pid);
+                    kill(monitor_pid, SIGUSR1);
+                }
+            }
+            else {
+                LOGW("PL: Reg State: Network missing");
+                is_network_ready = 0;
+                if(monitor_pid) {
+                    LOGW("PL: Notif mon(%d) netdown", monitor_pid);
+                    kill(monitor_pid, SIGUSR2);
+                }
+            }
+        }
+    }
+    s_rilenv->OnRequestComplete(t, e, response, responselen);
+}
+
+void interceptOnUnsolicitedResponse(int unsolResponse, const void *data, size_t datalen)
+{
+    LOGD("PL:interceptOnUnsolicitedResponse(%d) len=%d", unsolResponse, datalen);
+    if(is_data_active) {
+    }
+    s_rilenv->OnUnsolicitedResponse(unsolResponse, data, datalen);
+}
+
+void interceptRequestTimedCallback(RIL_TimedCallback callback, void *param,
+                                   const struct timeval *relativeTime)
+{
+    LOGD("PL:interceptRequestTimedCallback");
+    s_rilenv->RequestTimedCallback(callback, param, relativeTime);
+}
+
+
+void hackOnRequestDataCallList(char **data, size_t datalen, RIL_Token t)
+{
+    LOGD("PL:hackOnRequestDataCallList token=(%x)", (unsigned int)t);
+    request_call_list_token = t;
+}
+
+void hackOnRequestRegistrationState(char **data, size_t datalen, RIL_Token t)
+{
+    LOGD("PL:hackOnRequestRegistrationState token=(%x)", (unsigned int)t);
+    request_registration_state_token = t;
+}
 
 void hackDeactivateData(void *data, size_t datalen, RIL_Token t)
 {
 	int err;
 	char * cmd;
 	char * cid;
-	int fd,fd_smd,i,fd2;
+	int fd,i,fd2;
 	ATResponse *p_response = NULL;
-	struct termios  ios;
 
 	LOGD("PL: hackDeactivateData: starting\n");
-	fd_smd = open ("/dev/smd0", O_RDWR);
-
-	if(fd_smd  == -1)  {
-		LOGD("PL:hackDeactivateData: Error opening smd0\n");
-	}
-
-	tcgetattr( fd_smd, &ios );
-	ios.c_lflag = 0;  /* disable ECHO, ICANON, etc... */
-	tcsetattr( fd_smd, TCSANOW, &ios );
 
 	cid = ((char **)data)[0];
 	asprintf(&cmd, "AT+CGACT=0,%s", cid);
-	err = hackWrite(fd_smd, cmd);
-	free(cmd);
-	close(fd_smd);
+    send_modem(cmd);
 
-	// turn off pppd calling it once again, on failure kill it
-	system("pppd /dev/smd1");
-	sleep(1);
+    // kill monitor process
+    kill(monitor_pid, SIGTERM);
+    waitpid(monitor_pid, NULL, 0);
+    monitor_pid = 0;
+
+    // kill remaining pppd
 	system("killall pppd");
 	sleep(1);
 
@@ -132,6 +287,7 @@ void hackDeactivateData(void *data, size_t datalen, RIL_Token t)
 	}
 
 	LOGD("PL:hackDeactivateData: pppd killed");
+    is_data_active = 0;
 
 	RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 	return;
@@ -164,15 +320,6 @@ void hackSetupData(char **data, size_t datalen, RIL_Token t)
 
 	LOGD("PL:hackSetupData\n");
 
-	fd = open ("/dev/smd0", O_RDWR);
-
-	if(fd == -1)  {
-		LOGD("PL:hackSetupData: Error opening smd0\n");
-	}
-	tcgetattr( fd, &ios );
-	ios.c_lflag = 0;  /* disable ECHO, ICANON, etc... */
-	tcsetattr( fd, TCSANOW, &ios );
-
 	apn = ((const char **)data)[2];
 	user = ((char **)data)[3];
 	if(user != NULL)
@@ -201,31 +348,21 @@ void hackSetupData(char **data, size_t datalen, RIL_Token t)
 	asprintf(&cmd, "AT+CGDCONT=1,\"IP\",\"%s\",,0,0", apn);
 	//FIXME check for error here
 	//err = at_send_command(cmd, NULL);
-	hackWrite(fd, cmd);
+	send_modem(cmd);
 	free(cmd);
 	sleep(1);
 	// Set required QoS params to default
 	LOGD("PL:hackSetupData - AT+GCDREQ\n");
-	err = hackWrite(fd, "AT+CGQREQ=1");
+	send_modem("AT+CGQREQ=1");
 	sleep(1);
 	// Set minimum QoS params to default
 	LOGD("PL:hackSetupData - AT+GCDMIN\n");
-	err = hackWrite(fd, "AT+CGQMIN=1");
+	send_modem("AT+CGQMIN=1");
 	sleep(1);
 	// packet-domain event reporting
 	LOGD("PL:hackSetupData - AT+GCEREP\n");
-	err = hackWrite(fd, "AT+CGEREP=1,0");
+	send_modem("AT+CGEREP=1,0");
 	sleep(1);
-	// Hangup anything that's happening there now
-	LOGD("PL:hackSetupData - AT+CGACT\n");
-	err = hackWrite(fd, "AT+CGACT=0,1");
-	sleep(1);
-	// Start data on PDP context 1
-	LOGD("PL:hackSetupData - ATD*99\n");
-	err = hackWrite(fd, "ATD*99***1#");
-
-	sleep(1);
-	close(fd);
 
 	LOGD("PL: hackSetupData: saving secrets\n");
 	asprintf(&userpass, "%s * %s\n", user, pass);
@@ -291,19 +428,11 @@ void hackSetupData(char **data, size_t datalen, RIL_Token t)
 
 	// The modem replies immediately even if it's not connected!
 	// so wait a short time.
-
 	sleep(5);
 	LOGD("PL: hackSetupData: launching pppd\n");
-	mypppstatus = system("/system/bin/pppd /dev/smd1 defaultroute");
-	if (mypppstatus != 0) {
-		LOGD("PL: system(/system/bin/pppd failed\n");
-		goto error;
-	}
-	else {
-		LOGD("PL: hackSetupData: system(/system/bin/pppd returned %d\n", mypppstatus);
-	}
-	sleep(5); // allow time for ip-up to run
+    is_data_active = 1;
 
+    launch_pppd();
 
 	LOGD("PL:hack normal exit\n");
 	
@@ -314,91 +443,78 @@ void hackSetupData(char **data, size_t datalen, RIL_Token t)
 		RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
-static int
-checkHaretBoot()
-{
-  int fd;
-  char cmdline[512];
-
-  fd = open ("/proc/cmdline", O_RDONLY);
-
-  if (fd < 0)
-    {
-      LOGD("Unable to open /proc/cmdline");
-      return -1;
-    }
-
-  if (read (fd, cmdline, sizeof(cmdline)) < 0)
-    {
-      LOGD("Unable to read /proc/cmdline");
-      return -1;
-    }
-  LOGD("Kernel command line is: '%s'", cmdline);
-  
-  close (fd);
-  return strstr(cmdline,"nand_boot=0");
-}
-
-
 void writeAdditionalNandInit(){
 	LOGD("NAND boot, writing additional init commands to /dev/smd0");
-	int err = 0;
-	int fd_smd;
-	struct termios  ios;
-
-	fd_smd = open ("/dev/smd0", O_RDWR);
-
-	if(fd_smd  == -1)  {
-		LOGD("PL:writeInit: Error opening smd0\n");
-	}
-
-	tcgetattr( fd_smd, &ios );
-	ios.c_lflag = 0;  /* disable ECHO, ICANON, etc... */
-	tcsetattr( fd_smd, TCSANOW, &ios );
-	
-	err += hackWrite(fd_smd, "AT@BRIC=0");
+	send_modem("AT@BRIC=0");
 	sleep(1);
-	err += hackWrite(fd_smd, "AT+CFUN=0");
+	send_modem("AT+CFUN=0");
 	sleep(1);
-	err += hackWrite(fd_smd, "AT+COPS=2");
+	send_modem("AT+COPS=2");
 	sleep(1);
-	
-	close(fd_smd);
 }
 
 void (*htc_onRequest)(int request, void *data, size_t datalen, RIL_Token t);
 void onRequest(int request, void *data, size_t datalen, RIL_Token t) {
-	if(pppMode){
-		if(request==RIL_REQUEST_SETUP_DATA_CALL){ // Let's have fun !
-			hackSetupData(data, datalen, t);
-			return;
-		} else if(request==RIL_REQUEST_DEACTIVATE_DATA_CALL) {
-			hackDeactivateData(data, datalen, t);
-			return;
-		}
-	}
+    if(!rmnet_mode){
+        if(request==RIL_REQUEST_SETUP_DATA_CALL){ // Let's have fun !
+            hackSetupData(data, datalen, t);
+            return;
+        } else if(request==RIL_REQUEST_DEACTIVATE_DATA_CALL) {
+            hackDeactivateData(data, datalen, t);
+            return;
+        } else if(request == RIL_REQUEST_DATA_CALL_LIST) {
+            hackOnRequestDataCallList(data, datalen, t);
+            htc_onRequest(request, data, datalen, t);
+            return;
+        } else if(request == RIL_REQUEST_REGISTRATION_STATE) {
+            hackOnRequestRegistrationState(data, datalen, t);
+            htc_onRequest(request, data, datalen, t);
+            return;
+        }
+    }
 	return htc_onRequest(request, data, datalen, t);
 }
 
-const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **argv) {
-	s_rilenv = env;
+const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **argv) 
+{
+    int i;
+    int ril_argc = 0;
+    char **ril_argv;
+	RIL_RadioFunctions *(*htc_RIL_Init)(const struct RIL_Env *env, int argc, char **argv);
+	RIL_RadioFunctions *s_callbacks;
 
-	if(!checkHaretBoot()) writeAdditionalNandInit();
-	
-	if(file_exists("/system/etc/ppp/active")){
-			pppMode = 1;
-			LOGD("Using PPP mode");
-		} else {
-			LOGD("Using RMNET mode");
-		}
+	s_rilenv = env;
+    LOGW("HTC Ril Wrapper v0.3 starting");
+    // we never free this, but we can't tell if htc ril uses argv after init
+    ril_argv = (char **)malloc(argc * sizeof(char*));
+
+    // Parse command line and prepare ril command line
+    for(i = 0; i < argc ; i++) {
+        LOGW("RIL_Init arg[%d]=%s", i, argv[i]);
+        if(strcmp(argv[i], "rmnet_mode") == 0)
+            rmnet_mode = 1;
+        else if(strcmp(argv[i], "nand_init") == 0)
+            nand_init = 1;
+        else {
+            ril_argv[ril_argc++] = argv[i];
+        }
+    }
+
+    if(nand_init)
+        writeAdditionalNandInit();
 	
 	ril_handler=dlopen("/system/lib/libhtc_ril.so", 0/*Need to RTFM, 0 seems fine*/);
-	RIL_RadioFunctions* (*htc_RIL_Init)(const struct RIL_Env *env, int argc, char **argv);
+	htc_RIL_Init = dlsym(ril_handler, "RIL_Init");
 
-	htc_RIL_Init=dlsym(ril_handler, "RIL_Init");
-	RIL_RadioFunctions *s_callbacks;
-	s_callbacks=htc_RIL_Init(env, argc, argv);
-	htc_onRequest=s_callbacks->onRequest;
+    // re-route to our man in the middle functions
+    htcril_env.OnRequestComplete = interceptOnRequestComplete;
+    htcril_env.OnUnsolicitedResponse = interceptOnUnsolicitedResponse;
+    htcril_env.RequestTimedCallback = interceptRequestTimedCallback;
+
+    // TODO: pass the right argv/argc
+	s_callbacks = htc_RIL_Init(&htcril_env, ril_argc, ril_argv);
+
+	htc_onRequest = s_callbacks->onRequest;
 	s_callbacks->onRequest=onRequest;
 	return s_callbacks;
 }
