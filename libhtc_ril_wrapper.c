@@ -307,12 +307,6 @@ void interceptRequestTimedCallback(RIL_TimedCallback callback, void *param,
 }
 
 
-void hackOnRequestDataCallList(char **data, size_t datalen, RIL_Token t)
-{
-    LOGD("PL:hackOnRequestDataCallList token=(%x)", (unsigned int)t);
-    request_call_list_token = t;
-}
-
 void hackOnRequestRegistrationState(char **data, size_t datalen, RIL_Token t)
 {
     LOGD("PL:hackOnRequestRegistrationState token=(%x)", (unsigned int)t);
@@ -357,8 +351,10 @@ void hackDeactivateData(void *data, size_t datalen, RIL_Token t)
 		sleep(1);
 	}
 
-	LOGD("Deactdata done");
+	LOGD("Deactdata done, waiting 10 sec to let pppd die");
     is_data_active = 0;
+
+    sleep(10);
 
 	RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 	return;
@@ -525,13 +521,20 @@ void onRequest(int request, void *data, size_t datalen, RIL_Token t) {
         } else if(request==RIL_REQUEST_DEACTIVATE_DATA_CALL) {
             hackDeactivateData(data, datalen, t);
             return;
-        } else if(request == RIL_REQUEST_DATA_CALL_LIST) {
-            hackOnRequestDataCallList(data, datalen, t);
-            htc_onRequest(request, data, datalen, t);
-            return;
         } else if(request == RIL_REQUEST_REGISTRATION_STATE) {
             hackOnRequestRegistrationState(data, datalen, t);
             htc_onRequest(request, data, datalen, t);
+            return;
+        } else if(request == RIL_REQUEST_DATA_CALL_LIST) {
+            // cheat here
+            LOGW("*** Request call list, fake reply ***");
+            RIL_Data_Call_Response data_call;
+            data_call.cid = 1;
+            data_call.active = 1;
+            data_call.type = "IP";
+            data_call.apn = current_apn;
+            data_call.address = "";
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &data_call, sizeof(data_call));
             return;
         }
     }
@@ -547,7 +550,7 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
 	RIL_RadioFunctions *s_callbacks;
 
 	s_rilenv = env;
-    LOGW("----------- HTC Ril Wrapper v0.4 starting ------------");
+    LOGW("----------- HTC Ril Wrapper v0.7 starting ------------");
     // we never free this, but we can't tell if htc ril uses argv after init
     ril_argv = (char **)malloc(argc * sizeof(char*));
 
