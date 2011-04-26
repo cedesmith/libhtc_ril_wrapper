@@ -370,14 +370,13 @@ void* pppd_thread(void *param)
         kill(getppid(), SIGSTOP); //stop stealing my mojo 
         
         int act=0;
-        int actCount=0;
-        do{
-            send_modem("AT+CGACT?");
-            do {
-                read_modem(buff, sizeof(buff));
-                char* actpos=strstr(buff, "+CGACT: 1,");
-                if(actpos!=NULL) act=atoi(actpos+10);
-            }while(buff[0]!='0');
+        
+        send_modem("AT+CGACT?");
+        do {
+            read_modem(buff, sizeof(buff));
+            char* actpos=strstr(buff, "+CGACT: 1,");
+            if(actpos!=NULL) act=atoi(actpos+10);
+        }while(buff[0]!='0');
         
         if(act!=0) {
             kill(getppid(), SIGCONT);
@@ -613,35 +612,23 @@ void hackSetupData(char **data, size_t datalen, RIL_Token t)
     //save auth
     truncate("/etc/ppp/pap-secrets", 0);
     truncate("/etc/ppp/chap-secrets", 0);
-    int auth = 0;
-    if(((char **)data)[5]!=NULL) auth=atoi(((char **)data)[5]);
-    if(auth==0) LOGD("No auth required");
-    if(auth==1 || auth==3){
-        char buff[128];
-        LOGD("    AUTH:PAP");
-        sprintf(buff, "%s * %s\n", user, pass);
-        int fd=creat("/etc/ppp/pap-secrets", S_IRUSR|S_IWUSR);
-        if(fd==-1) {
-            LOGE("Failed to create /etc/ppp/pap-secrets");
-            goto error;
-        } else {
-            write(fd, buff, strlen(buff));
-            close(fd);
-        }
+    char buff[128];
+    sprintf(buff, "%s * %s\n", user, pass);
+    int fd;
+    if((fd=creat("/etc/ppp/pap-secrets", S_IRUSR|S_IWUSR))==-1) {
+        LOGE("Failed to create /etc/ppp/pap-secrets");
+        lastDataError=PDP_FAIL_USER_AUTHENTICATION;
+        goto error;
     }
-    if(auth==2 || auth==3){
-        char buff[128];
-        LOGD("    AUTH:CHAP");
-        sprintf(buff, "%s * %s\n", user, pass);
-        int fd=creat("/etc/ppp/chap-secrets", S_IRUSR|S_IWUSR);
-        if(fd==-1) {
-            LOGE("Failed to create /etc/ppp/chap-secrets");
-            goto error;
-        } else {
-            write(fd, buff, strlen(buff));
-            close(fd);
-        }
+    write(fd, buff, strlen(buff));
+    close(fd);
+    if((fd=creat("/etc/ppp/chap-secrets", S_IRUSR|S_IWUSR))==-1) {
+        LOGE("Failed to create /etc/ppp/chap-secrets");
+        lastDataError=PDP_FAIL_USER_AUTHENTICATION;
+        goto error;
     }
+    write(fd, buff, strlen(buff));
+    close(fd);  
 
     pthread_t tid;
     pthread_create(&tid, NULL, SetupData, t);  
@@ -692,7 +679,7 @@ void interceptOnRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t
 
 void hackDataCallList(char **data, size_t datalen, RIL_Token t)
 {
-    RIL_Data_Call_Response dataCall={ .cid=1, .active=(dataConnectionState==DATA_STATE_CONNECTED?1:0), .type="IP", .apn=current_apn, .address=current_addr };
+    RIL_Data_Call_Response dataCall={ .cid=1, .active=0, .type="IP", .apn=current_apn, .address=current_addr };
     LOGD("%s: DataCallList", logtime());
     LOGD("    cid=%d, active=%d, type=%s, apn=%s, add=%s", dataCall.cid, dataCall.active, dataCall.type, dataCall.apn, dataCall.address);
     s_rilenv->OnRequestComplete(t, RIL_E_SUCCESS, &dataCall, sizeof(RIL_Data_Call_Response));
@@ -739,7 +726,7 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
     RIL_RadioFunctions *s_callbacks;
 
     s_rilenv = env;
-    LOGD("----------- HTC Ril Wrapper v0.8b4 starting ------------");
+    LOGD("----------- HTC Ril Wrapper v0.8b5 starting ------------");
     // we never free this, but we can't tell if htc ril uses argv after init
     ril_argv = (char **)malloc(argc * sizeof(char*));
 
